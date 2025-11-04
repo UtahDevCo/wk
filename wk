@@ -1,0 +1,301 @@
+#!/bin/bash
+# Compatible with both bash and zsh
+
+# wk - Git Worktree Manager
+# Manages git worktrees with one-word US state names
+# Usage: source wk (then call wk command)
+
+# Array of one-word US states (alphabetically ordered)
+declare -a STATES=(
+  "Alabama"
+  "Alaska"
+  "Arizona"
+  "Arkansas"
+  "Colorado"
+  "Connecticut"
+  "Delaware"
+  "Florida"
+  "Georgia"
+  "Hawaii"
+  "Idaho"
+  "Illinois"
+  "Indiana"
+  "Iowa"
+  "Kansas"
+  "Kentucky"
+  "Louisiana"
+  "Maine"
+  "Maryland"
+  "Massachusetts"
+  "Michigan"
+  "Minnesota"
+  "Mississippi"
+  "Missouri"
+  "Montana"
+  "Nebraska"
+  "Nevada"
+)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Get the repository root
+get_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null
+}
+
+# Validate git repository exists
+check_git_repo() {
+  if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo -e "${RED}Error: Not in a git repository${NC}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Initialize worktrees directory
+init_worktrees_dir() {
+  local repo_root="$(get_repo_root)"
+  local wt_dir="${repo_root}/.worktrees"
+
+  if [[ ! -d "$wt_dir" ]]; then
+    mkdir -p "$wt_dir"
+  fi
+
+  echo "$wt_dir"
+}
+
+# Get the current state index
+get_current_state_index() {
+  local wt_dir="$(init_worktrees_dir)"
+  local state_file="${wt_dir}/.wk-state"
+
+  if [[ -f "$state_file" ]]; then
+    local index=$(cat "$state_file" 2>/dev/null)
+    # Ensure we have a valid number
+    if [[ -z "$index" ]] || ! [[ "$index" =~ ^[0-9]+$ ]]; then
+      echo "0"
+    else
+      echo "$index"
+    fi
+  else
+    echo "0"
+  fi
+}
+
+# Increment and save state index
+increment_state_index() {
+  local wt_dir="$(init_worktrees_dir)"
+  local state_file="${wt_dir}/.wk-state"
+  local current_index=$(get_current_state_index)
+  local next_index=$(( (current_index + 1) % ${#STATES[@]} ))
+
+  echo "$next_index" > "$state_file"
+}
+
+# Get the next available state name
+get_next_state() {
+  local index=$(get_current_state_index)
+  # zsh uses 1-based indexing, bash uses 0-based
+  # Detect which shell we're in and adjust accordingly
+  if [[ -n "${ZSH_VERSION}" ]]; then
+    # zsh: add 1 to convert from 0-based to 1-based
+    echo "${STATES[$((index + 1))]}"
+  else
+    # bash: use index as-is
+    echo "${STATES[$index]}"
+  fi
+}
+
+# Check if a worktree already exists
+worktree_exists() {
+  local state_name="$1"
+  local wt_dir="$(init_worktrees_dir)"
+  local state_lower=$(echo "$state_name" | tr '[:upper:]' '[:lower:]')
+  local wt_path="${wt_dir}/${state_lower}"
+
+  [[ -d "$wt_path" ]]
+}
+
+# Get all existing worktrees
+get_existing_worktrees() {
+  local wt_dir="$(init_worktrees_dir)"
+  local repo_root="$(get_repo_root)"
+
+  # Use git worktree list to get all worktrees
+  git worktree list --porcelain | grep "^worktree" | while read -r line; do
+    local wt_path="${line#worktree }"
+    # Only show worktrees in .worktrees directory
+    if [[ "$wt_path" == "${wt_dir}"* ]]; then
+      echo "$wt_path"
+    fi
+  done
+}
+
+# Create a new worktree
+create_worktree() {
+  local branch_name="$1"
+  local state_name=$(get_next_state)
+  local state_lower=$(echo "$state_name" | tr '[:upper:]' '[:lower:]')
+  local wt_dir="$(init_worktrees_dir)"
+  local wt_path="${wt_dir}/${state_lower}"
+
+  # Check if state name is already in use
+  if worktree_exists "$state_name"; then
+    echo -e "${RED}Error: Worktree for state '$state_name' already exists at $wt_path${NC}" >&2
+    return 1
+  fi
+
+  # Check if branch exists on remote
+  if git ls-remote --heads origin "$branch_name" > /dev/null 2>&1; then
+    echo -e "${BLUE}Branch '$branch_name' found on remote. Creating worktree from remote branch...${NC}"
+    if ! git worktree add --track -b "$state_lower" "$wt_path" "origin/$branch_name"; then
+      echo -e "${RED}Error: Failed to create worktree${NC}" >&2
+      return 1
+    fi
+  else
+    echo -e "${BLUE}Branch '$branch_name' not found on remote. Creating local branch...${NC}"
+    if ! git worktree add -b "$state_lower" "$wt_path" "HEAD"; then
+      echo -e "${RED}Error: Failed to create worktree${NC}" >&2
+      return 1
+    fi
+    # Create tracking branch for the input branch name
+    cd "$wt_path" || return 1
+    git checkout -b "$branch_name" 2>/dev/null || true
+  fi
+
+  # Increment state index for next time
+  increment_state_index
+
+  echo -e "${GREEN}Worktree created at: $wt_path${NC}"
+  echo -e "${GREEN}Worktree state: $state_name${NC}"
+
+  # Change to the worktree directory
+  cd "$wt_path" || return 1
+}
+
+# Remove a worktree
+remove_worktree() {
+  local wt_dir="$(init_worktrees_dir)"
+
+  # Build array without subshell
+  local -a existing_wts
+  while IFS= read -r wt_path; do
+    existing_wts+=("$wt_path")
+  done < <(get_existing_worktrees)
+
+  if [[ ${#existing_wts[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}No worktrees found${NC}"
+    return 0
+  fi
+
+  # Display existing worktrees
+  echo -e "${BLUE}Existing worktrees:${NC}"
+  local i=1
+  for wt in "${existing_wts[@]}"; do
+    local state_name=$(basename "$wt")
+    local branch=$(cd "$wt" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    printf "%d) %s (branch: %s)\n" "$i" "$state_name" "$branch"
+    ((i++))
+  done
+
+  # Prompt user for selection
+  echo -n "Select worktree to remove (number): "
+  read selection
+
+  if ! [[ "$selection" =~ ^[0-9]+$ ]] || (( selection < 1 || selection > ${#existing_wts[@]} )); then
+    echo -e "${RED}Invalid selection${NC}" >&2
+    return 1
+  fi
+
+  # Adjust for zsh 1-based indexing
+  local array_index=$selection
+  if [[ -n "${ZSH_VERSION}" ]]; then
+    array_index=$selection
+  else
+    array_index=$((selection - 1))
+  fi
+
+  local target_wt="${existing_wts[$array_index]}"
+  local state_name=$(basename "$target_wt")
+
+  # Remove the worktree
+  if git worktree remove "$target_wt"; then
+    echo -e "${GREEN}Worktree removed: $state_name${NC}"
+  else
+    echo -e "${RED}Error: Failed to remove worktree${NC}" >&2
+    return 1
+  fi
+}
+
+# List all worktrees
+list_worktrees() {
+  # Build array without subshell
+  local -a existing_wts
+  while IFS= read -r wt_path; do
+    existing_wts+=("$wt_path")
+  done < <(get_existing_worktrees)
+
+  if [[ ${#existing_wts[@]} -eq 0 ]]; then
+    echo -e "${YELLOW}No worktrees found${NC}"
+    return 0
+  fi
+
+  echo -e "${BLUE}Existing worktrees:${NC}"
+  for wt in "${existing_wts[@]}"; do
+    local state_name=$(basename "$wt")
+    local branch=$(cd "$wt" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    local commit=$(cd "$wt" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    printf "  %-20s branch: %-20s commit: %s\n" "$state_name" "$branch" "$commit"
+  done
+
+  echo ""
+  echo -e "${BLUE}Next state to use: $(get_next_state)${NC}"
+}
+
+# Main menu
+wk() {
+  # Check if we're in a git repository
+  if ! check_git_repo; then
+    return 1
+  fi
+
+  echo ""
+  echo -e "${BLUE}=== Git Worktree Manager ===${NC}"
+  echo "1) Create new worktree"
+  echo "2) Remove worktree"
+  echo "3) List worktrees"
+  echo ""
+
+  echo -n "Select option (1-3): "
+  read option
+
+  case "$option" in
+    1)
+      echo -n "Enter branch name to check out: "
+      read branch_name
+      if [[ -z "$branch_name" ]]; then
+        echo -e "${RED}Error: Branch name cannot be empty${NC}" >&2
+        return 1
+      fi
+      create_worktree "$branch_name"
+      ;;
+    2)
+      remove_worktree
+      ;;
+    3)
+      list_worktrees
+      ;;
+    *)
+      echo -e "${RED}Invalid option${NC}" >&2
+      return 1
+      ;;
+  esac
+}
+
+# This script should be sourced, not executed
+# When sourced, it only defines the functions above
