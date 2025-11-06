@@ -136,6 +136,47 @@ get_existing_worktrees() {
   done
 }
 
+# Handle bootstrap for worktree
+run_bootstrap_for_worktree() {
+  local wt_path="$1"
+  local wt_dir="$(init_worktrees_dir)"
+  local bootstrap_file="${wt_dir}/bootstrap"
+
+  # If bootstrap file doesn't exist, create it with default content
+  if [[ ! -f "$bootstrap_file" ]]; then
+    cat > "$bootstrap_file" << 'EOF'
+#!/bin/bash
+# Bootstrap script for worktree setup
+echo ".worktrees/bootstrap is empty. Edit the file to set up your worktree"
+EOF
+    chmod +x "$bootstrap_file"
+    echo -e "${YELLOW}Bootstrap file created at: $bootstrap_file${NC}"
+    echo -e "${YELLOW}Edit it to configure your worktree setup${NC}"
+    return 0
+  fi
+
+  # Bootstrap file exists, ask user if they want to execute it
+  echo ""
+  echo -e "${BLUE}Bootstrap script found at: $bootstrap_file${NC}"
+  echo -n "Do you want to execute the bootstrap script? (y/n): "
+  read response
+
+  if [[ "$response" == "y" || "$response" == "Y" ]]; then
+    echo -e "${BLUE}Running bootstrap script from $wt_path...${NC}"
+    # Execute the script from inside the worktree directory
+    if (cd "$wt_path" && bash "$bootstrap_file"); then
+      echo -e "${GREEN}Bootstrap script executed successfully${NC}"
+    else
+      echo -e "${RED}Bootstrap script failed${NC}" >&2
+      return 1
+    fi
+  else
+    echo -e "${YELLOW}Bootstrap script skipped${NC}"
+  fi
+
+  return 0
+}
+
 # Create a new worktree
 create_worktree() {
   local branch_name="$1"
@@ -150,22 +191,35 @@ create_worktree() {
     return 1
   fi
 
-  # Check if branch exists on remote
-  if git ls-remote --heads origin "$branch_name" > /dev/null 2>&1; then
-    echo -e "${BLUE}Branch '$branch_name' found on remote. Creating worktree from remote branch...${NC}"
-    if ! git worktree add --track -b "$state_lower" "$wt_path" "origin/$branch_name"; then
-      echo -e "${RED}Error: Failed to create worktree${NC}" >&2
-      return 1
-    fi
-  else
-    echo -e "${BLUE}Branch '$branch_name' not found on remote. Creating local branch...${NC}"
-    if ! git worktree add -b "$state_lower" "$wt_path" "HEAD"; then
-      echo -e "${RED}Error: Failed to create worktree${NC}" >&2
-      return 1
-    fi
-    # Create tracking branch for the input branch name
+  # Try to create the worktree with the branch name
+  echo -e "${BLUE}Creating worktree...${NC}"
+
+  # First try: fetch the branch and create worktree from origin with new branch
+  if git fetch origin "$branch_name" 2>/dev/null && git worktree add --track -b "$branch_name" "$wt_path" "origin/$branch_name" 2>/dev/null; then
+    echo -e "${GREEN}Worktree created from remote branch${NC}"
+  # Second try: branch already exists locally, just check it out in the worktree
+  elif git worktree add "$wt_path" "$branch_name" 2>/dev/null; then
+    echo -e "${GREEN}Worktree created from existing branch${NC}"
+  # Third try: assume it's a remote-only branch that git can resolve directly
+  elif git worktree add --track "$wt_path" "origin/$branch_name" 2>/dev/null; then
+    echo -e "${GREEN}Worktree created from remote branch${NC}"
+  # Fourth try: create from HEAD and manually checkout the remote branch
+  elif git worktree add "$wt_path" "HEAD" 2>/dev/null; then
     cd "$wt_path" || return 1
-    git checkout -b "$branch_name" 2>/dev/null || true
+    # Now fetch and properly check out the remote branch
+    if git fetch origin "$branch_name" 2>/dev/null; then
+      # Reset to the remote branch
+      git reset --hard "origin/$branch_name" 2>/dev/null || true
+      # Try to set up tracking, but don't fail if we can't
+      git branch --set-upstream-to="origin/$branch_name" 2>/dev/null || true
+      echo -e "${GREEN}Worktree created from fetched remote branch${NC}"
+    else
+      echo -e "${GREEN}Worktree created (detached HEAD)${NC}"
+    fi
+    cd - > /dev/null || return 1
+  else
+    echo -e "${RED}Error: Failed to create worktree${NC}" >&2
+    return 1
   fi
 
   # Increment state index for next time
@@ -173,6 +227,11 @@ create_worktree() {
 
   echo -e "${GREEN}Worktree created at: $wt_path${NC}"
   echo -e "${GREEN}Worktree state: $state_name${NC}"
+
+  # Run bootstrap for the worktree
+  if ! run_bootstrap_for_worktree "$wt_path"; then
+    return 1
+  fi
 
   # Change to the worktree directory
   cd "$wt_path" || return 1
